@@ -220,11 +220,50 @@ impl StreamManager {
     async fn make_request_raw(
         &self,
         url: String,
-        headers: reqwest::header::HeaderMap,
+        mut headers: reqwest::header::HeaderMap,
     ) -> AppResult<Response> {
+        // Per-request opt-in to skip TLS certificate validation when the
+        // matching header is set by the caller (typically an extractor that
+        // knows the origin uses an expired or self-signed cert).  The header
+        // is consumed (stripped) so it isn't forwarded upstream.
+        let disable_ssl = headers
+            .remove("x-mfp-disable-ssl")
+            .map(|v| {
+                let s = v.to_str().unwrap_or("").trim().to_ascii_lowercase();
+                matches!(s.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false);
+
         let proxy_config = self.proxy_router.get_proxy_config(&url);
 
-        let client = if let Some(route_config) = proxy_config {
+        let client = if disable_ssl {
+            // Per-request insecure override: build (and cache) a client that
+            // accepts invalid certs while keeping the active proxy/transport
+            // settings.  Cache key includes "insecure" so it never collides
+            // with the secure variant.
+            let (proxy_flag, proxy_url, verify_ssl_was) = match proxy_config.as_ref() {
+                Some(rc) => (rc.proxy, rc.proxy_url.clone(), rc.verify_ssl),
+                None => (false, None, true),
+            };
+            let _ = verify_ssl_was; // not used in key — we force false below
+            let cache_key = format!(
+                "insecure|{}|{}",
+                proxy_flag,
+                proxy_url.as_deref().unwrap_or(""),
+            );
+            if let Some(cached) = self.route_clients.get(&cache_key) {
+                cached.clone()
+            } else {
+                let override_route = ProxyRouteConfig {
+                    proxy: proxy_flag,
+                    proxy_url,
+                    verify_ssl: false,
+                };
+                let new_client = Self::build_route_client(&self.config, &override_route)?;
+                self.route_clients.insert(cache_key, new_client.clone());
+                new_client
+            }
+        } else if let Some(route_config) = proxy_config {
             let cache_key = format!(
                 "{}|{}|{}",
                 route_config.proxy,
